@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
@@ -84,6 +84,14 @@ const STREAM_READ_CHANNEL_CAP: usize = 16;
 const UDP_SESSION_QUEUE: usize = 64;
 const RECV_BURST: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// A receive burst's ACK is held back until this many packets have arrived...
+const ACK_COALESCE_PKTS: u32 = 8;
+/// ...or the first unacknowledged packet is this old, whichever comes first.
+/// Far below the 25 ms default `max_ack_delay`, so loss recovery is unaffected.
+const ACK_COALESCE_DELAY: Duration = Duration::from_micros(200);
+/// An ACK may carry upstream data, so nothing is held back while the
+/// application wrote within this window (request/response, uploads).
+const ACK_COALESCE_APP_QUIET: Duration = Duration::from_millis(1);
 /// Id 0 is the HTTP/3 auth request; proxy bidi streams start at 4, step 4.
 const FIRST_PROXY_STREAM_ID: u64 = 4;
 
@@ -284,19 +292,36 @@ async fn run(
     }
 
     let mut exit = Error::Closed;
+    // Packets received (and first arrival time) since the last flush.
+    let mut ack_pending: u32 = 0;
+    let mut ack_since: Option<Instant> = None;
+    let mut last_app_cmd = Instant::now() - ACK_COALESCE_APP_QUIET;
     loop {
-        let timeout = conn.timeout();
+        // Wake no later than the ACK-coalescing deadline, so a held ACK is
+        // never dragged past it.
+        let mut timeout = conn.timeout();
+        if let Some(since) = ack_since {
+            let left = ACK_COALESCE_DELAY.saturating_sub(since.elapsed());
+            timeout = Some(timeout.map_or(left, |t| t.min(left)));
+        }
+        let mut received = 0u32;
+        let mut woke_on_cmd = false;
+        let mut woke_on_notify = false;
         tokio::select! {
             r = st.socket.recv_from(&mut recv_buf) => {
                 match r {
                     Ok((n, from)) => {
+                        received = 1;
                         recv_one(&st, &mut conn, &recv_buf[..n], from);
                         // quiche ACKs on the next send(), so feed it every packet already
                         // queued before pumping; otherwise each data packet costs one
                         // ACK-only sendto.
                         for _ in 1..RECV_BURST {
                             match st.socket.try_recv_from(&mut recv_buf) {
-                                Ok((n, from)) => recv_one(&st, &mut conn, &recv_buf[..n], from),
+                                Ok((n, from)) => {
+                                    received += 1;
+                                    recv_one(&st, &mut conn, &recv_buf[..n], from)
+                                }
                                 Err(_) => break,
                             }
                         }
@@ -305,13 +330,14 @@ async fn run(
                 }
             }
             maybe = st.cmd_rx.recv() => {
+                woke_on_cmd = true;
                 match maybe {
                     Some(cmd) => handle_cmd(&mut st, &mut conn, cmd),
                     None => { let _ = conn.close(true, 0x0, b"done"); }
                 }
             }
             _ = sleep_opt(timeout) => { conn.on_timeout(); }
-            _ = st.read_notify.notified() => {}
+            _ = st.read_notify.notified() => { woke_on_notify = true; }
             _ = keep_alive.tick(), if auth_done => {
                 let _ = conn.send_ack_eliciting();
             }
@@ -354,6 +380,28 @@ async fn run(
         }
         pump_writes(&mut st, &mut conn);
         cleanup_streams(&mut st, &mut conn);
+
+        // Only receive / read-notify wakeups may skip the flush; commands, the
+        // quiche timer and the coalescing deadline always send.
+        if woke_on_cmd {
+            last_app_cmd = Instant::now();
+        }
+        if auth_done && last_app_cmd.elapsed() >= ACK_COALESCE_APP_QUIET {
+            if received > 0 {
+                ack_pending += received;
+                ack_since.get_or_insert_with(Instant::now);
+            }
+            if let Some(since) = ack_since {
+                if (received > 0 || woke_on_notify)
+                    && ack_pending < ACK_COALESCE_PKTS
+                    && since.elapsed() < ACK_COALESCE_DELAY
+                {
+                    continue;
+                }
+            }
+        }
+        ack_pending = 0;
+        ack_since = None;
 
         if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
             tracing::debug!("hysteria2 quiche send failed: {e}");
