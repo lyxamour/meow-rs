@@ -109,7 +109,7 @@ impl ReconnectableClient {
         Ok(UdpSession::new(session_id, handle.cmd_tx.clone(), rx))
     }
 
-    async fn handle(&self) -> Result<Arc<ConnHandle>> {
+    pub(crate) async fn handle(&self) -> Result<Arc<ConnHandle>> {
         let mut guard = self.conn.lock().await;
         if let Some((handle, generation)) = guard.as_ref() {
             if *generation == self.generation() && handle.is_active() {

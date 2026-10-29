@@ -17,7 +17,7 @@ use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
 use super::{Config, Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -60,6 +60,8 @@ pub(crate) enum ReadItem {
 pub(crate) struct ConnHandle {
     pub(crate) cmd_tx: mpsc::Sender<Cmd>,
     pub(crate) udp_enabled: bool,
+    /// Brutal target rate in bytes per second; 0 when Brutal is not in use.
+    pub(crate) brutal_bps: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
     _task: DriverTask,
 }
@@ -268,8 +270,10 @@ pub(crate) async fn spawn(
         tx_bps: cfg.tx_bps,
     };
     let closed_task = Arc::clone(&closed);
+    let brutal_bps = Arc::new(AtomicU64::new(0));
+    let brutal_task = Arc::clone(&brutal_bps);
     let task = DriverTask(tokio::spawn(async move {
-        run(state, conn, auth, ready_tx).await;
+        run(state, conn, auth, ready_tx, brutal_task).await;
         closed_task.store(true, Ordering::Relaxed);
     }));
 
@@ -280,6 +284,7 @@ pub(crate) async fn spawn(
     Ok(ConnHandle {
         cmd_tx,
         udp_enabled,
+        brutal_bps,
         closed,
         _task: task,
     })
@@ -290,6 +295,7 @@ async fn run(
     mut conn: quiche::Connection,
     auth: AuthCtx,
     ready_tx: oneshot::Sender<Result<bool>>,
+    brutal_bps: Arc<AtomicU64>,
 ) {
     let mut ready_tx = Some(ready_tx);
     let mut handshake: Option<Auth> = None;
@@ -388,7 +394,10 @@ async fn run(
                             // Only fails for a non-gcongestion sender, which
                             // `build_quiche_config` sets whenever `up` is set.
                             match conn.set_brutal_bandwidth(rate) {
-                                Ok(()) => st.pace = true,
+                                Ok(()) => {
+                                    st.pace = true;
+                                    brutal_bps.store(rate, Ordering::Relaxed);
+                                }
                                 Err(e) => tracing::warn!("hysteria2 brutal not enabled: {e}"),
                             }
                         }

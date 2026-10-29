@@ -724,46 +724,18 @@ async fn lone_packet_is_acked_within_the_coalescing_deadline() {
     assert!(median < 12_000, "median ACK lag {median} us: {lags:?}");
 }
 
-/// Seconds to push and get echoed back `UPLOAD` bytes through a client with `up` = `tx_bps`.
-const UPLOAD: usize = 2 * 1024 * 1024;
-
-async fn echo_time(tx_bps: u64) -> Duration {
-    let peer = peer(true, Some(0), 16).await;
-    let client = peer.client_up(false, tx_bps);
-    let stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
-        .await
-        .unwrap()
-        .unwrap();
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let started = Instant::now();
-    timeout(Duration::from_secs(20), async {
-        tokio::join!(
-            async {
-                writer.write_all(&vec![0x5a; UPLOAD]).await.unwrap();
-                writer.shutdown().await.unwrap();
-            },
-            async {
-                let mut echoed = Vec::new();
-                reader.read_to_end(&mut echoed).await.unwrap();
-                assert_eq!(echoed.len(), UPLOAD);
-            }
-        );
-    })
-    .await
-    .unwrap();
-    started.elapsed()
-}
-
-/// `up` engages Brutal: the upload is held to about that rate (loopback RTT is
-/// tiny, so cwnd binds before pacing does; pacing is checked in the netem run).
-/// Without `up` nothing changes and loopback is unthrottled.
+/// `up` engages Brutal at `min(server CC-RX, up)`; without `up` the connection
+/// is left alone. (The rate itself is checked in `auth.rs`; pacing and loss
+/// compensation in quiche and in the netem run.)
 #[tokio::test]
-async fn up_paces_the_upload_and_zero_leaves_it_alone() {
-    let unpaced = echo_time(0).await;
-    // 2 MiB at 3 MB/s needs about 0.7 s, minus the initial burst.
-    let paced = echo_time(3_000_000).await;
-    eprintln!("BRUTAL_UPLOAD unpaced={unpaced:?} paced={paced:?}");
-    assert!(paced >= Duration::from_millis(500), "paced {paced:?}");
-    assert!(paced < Duration::from_secs(5), "paced {paced:?}");
-    assert!(unpaced * 3 < paced, "unpaced {unpaced:?} paced {paced:?}");
+async fn up_engages_brutal_and_zero_leaves_it_alone() {
+    for (tx_bps, expected) in [(0, 0), (3_000_000, 3_000_000)] {
+        let peer = peer(true, Some(0), 16).await; // one QUIC connection per peer
+        let client = peer.client_up(false, tx_bps);
+        let handle = timeout(TEST_TIMEOUT, client.handle())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.brutal_bps.load(Ordering::Relaxed), expected);
+    }
 }
