@@ -3026,7 +3026,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.7"
-source = "git+https://github.com/lyxamour/quiche?rev=9b2d93693d1bf0ea9e17071e9c3d7b91c7c2b58b#9b2d93693d1bf0ea9e17071e9c3d7b91c7c2b58b"
+source = "git+https://github.com/lyxamour/quiche?rev=51480686edb88ea88b302fc99e44555f6e515d62#51480686edb88ea88b302fc99e44555f6e515d62"
 
 [[package]]
 name = "oid-registry"
@@ -3402,7 +3402,7 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 [[package]]
 name = "quiche"
 version = "0.30.0"
-source = "git+https://github.com/lyxamour/quiche?rev=9b2d93693d1bf0ea9e17071e9c3d7b91c7c2b58b#9b2d93693d1bf0ea9e17071e9c3d7b91c7c2b58b"
+source = "git+https://github.com/lyxamour/quiche?rev=51480686edb88ea88b302fc99e44555f6e515d62#51480686edb88ea88b302fc99e44555f6e515d62"
 dependencies = [
  "boring",
  "boring-sys",

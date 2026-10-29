@@ -275,4 +275,4 @@ meow-config = { path = "crates/meow-config", version = "0.26.1", default-feature
 # Brutal congestion control (hysteria2 `up`) is not in upstream quiche
 # (cloudflare/quiche#2549). Fork branch `hotarubi` = 0.30.0 + Brutal + Connection::set_brutal_bandwidth.
 [patch.crates-io]
-quiche = { git = "https://github.com/lyxamour/quiche", rev = "9b2d93693d1bf0ea9e17071e9c3d7b91c7c2b58b" }
+quiche = { git = "https://github.com/lyxamour/quiche", rev = "51480686edb88ea88b302fc99e44555f6e515d62" }

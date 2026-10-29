@@ -62,6 +62,10 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     // client's congestion control without `up`, and Brutal replaces it after
     // authentication (`Connection::set_brutal_bandwidth` needs this sender).
     quic.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
+    // quiche's BBRv2 treats loss above 1.5% as congestion; sing-quic's and
+    // mihomo's BBR do not. Netem 5% random loss + 20 ms, 128 MiB upload:
+    // default 12-18 Mbit/s, 0.3 -> 177-251, 0.6 -> 295-398, sing-box ~450.
+    quic.set_bbr_loss_threshold(0.6);
 
     Ok(quic)
 }
