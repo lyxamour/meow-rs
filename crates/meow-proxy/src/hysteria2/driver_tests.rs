@@ -662,3 +662,38 @@ async fn acks_are_sent_once_per_burst_of_queued_packets() {
         "{small} ACK-only packets for {big} payload packets"
     );
 }
+
+/// The upload side of the test above: writes already queued on the command
+/// channel are handled together, so one flush carries them in one packet
+/// instead of one tiny packet per write.
+#[tokio::test]
+async fn queued_writes_share_packets() {
+    let peer = peer(true, Some(0), 16).await;
+    let client = peer.client(false);
+    let mut stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    // Let the handshake's own ACKs settle before counting.
+    sleep(Duration::from_millis(200)).await;
+    let before = peer.small_rx.load(Ordering::Relaxed);
+    let writes = 128;
+    for i in 0..writes {
+        // Every write is distinct, so the echo below proves order and loss.
+        stream.write_all(&[i as u8; 10]).await.unwrap();
+    }
+    let mut echoed = vec![0; 10 * writes];
+    timeout(TEST_TIMEOUT, stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    for (i, chunk) in echoed.chunks(10).enumerate() {
+        assert_eq!(chunk, [i as u8; 10], "write {i} came back wrong");
+    }
+    let packets = peer.small_rx.load(Ordering::Relaxed) - before;
+    eprintln!("WRITE_PACKETS {packets} for {writes} writes");
+    assert!(
+        packets < writes / 4,
+        "{packets} small packets for {writes} queued writes"
+    );
+}

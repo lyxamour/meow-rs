@@ -86,6 +86,8 @@ const UDP_SESSION_QUEUE: usize = 64;
 /// flush then acknowledges the whole batch, where a flush per datagram sent
 /// an ACK (and a syscall) for every packet of a download.
 const RECV_BATCH: usize = 32;
+/// Commands handled per wakeup, for the same reason on the upload side.
+const CMD_BATCH: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Id 0 is the HTTP/3 auth request; proxy bidi streams start at 4, step 4.
 const FIRST_PROXY_STREAM_ID: u64 = 4;
@@ -309,7 +311,13 @@ async fn run(
             }
             maybe = st.cmd_rx.recv() => {
                 match maybe {
-                    Some(cmd) => handle_cmd(&mut st, &mut conn, cmd),
+                    Some(cmd) => {
+                        handle_cmd(&mut st, &mut conn, cmd);
+                        for _ in 1..CMD_BATCH {
+                            let Ok(cmd) = st.cmd_rx.try_recv() else { break };
+                            handle_cmd(&mut st, &mut conn, cmd);
+                        }
+                    }
                     None => { let _ = conn.close(true, 0x0, b"done"); }
                 }
             }
