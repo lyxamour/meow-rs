@@ -859,7 +859,7 @@ async fn flush_send(
 }
 
 /// Largest UDP payload quiche is allowed to grow to once path MTU discovery
-/// succeeds (quic-go: `MaxPacketBufferSize`, 1452 = 1500 - IPv4 and UDP
+/// succeeds (quic-go: `MaxPacketBufferSize`, 1452 = 1500 - IPv6 and UDP
 /// headers). The client sends 1200-byte packets until a probe is acked.
 pub(super) const MAX_UDP_PAYLOAD: usize = 1452;
 
