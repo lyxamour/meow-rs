@@ -58,11 +58,10 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     // UDP relay rides QUIC datagrams.
     quic.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
 
-    // Brutal replaces BBR after authentication (`Connection::set_brutal_bandwidth`),
-    // which needs the gcongestion sender. Without `up` keep quiche's default.
-    if config.tx_bps != 0 {
-        quic.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
-    }
+    // BBR like sing-quic (hysteria2/client.go:598-608) and mihomo: it is the
+    // client's congestion control without `up`, and Brutal replaces it after
+    // authentication (`Connection::set_brutal_bandwidth` needs this sender).
+    quic.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
 
     Ok(quic)
 }
@@ -169,6 +168,35 @@ mod tests {
     use boring::pkey::{PKey, Private};
     use boring::x509::X509;
     use tokio::net::UdpSocket;
+
+    /// quiche exposes no getter for the algorithm; `set_brutal_bandwidth` only
+    /// succeeds on the BBR2 (gcongestion) sender, so it tells BBR from CUBIC.
+    #[test]
+    fn default_congestion_control_is_bbr2_with_and_without_up() {
+        for tx_bps in [0, 12_500_000] {
+            let cfg = Config {
+                insecure: true,
+                tx_bps,
+                ..Config::default()
+            };
+            let mut quic = build_quiche_config(&cfg).unwrap();
+            let local: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let peer: std::net::SocketAddr = "127.0.0.1:2".parse().unwrap();
+            let mut conn = quiche::connect(
+                Some("localhost"),
+                &quiche::ConnectionId::from_ref(&[1; 16]),
+                local,
+                peer,
+                &mut quic,
+            )
+            .unwrap();
+            assert_eq!(
+                conn.set_brutal_bandwidth(1_000_000),
+                Ok(()),
+                "tx_bps={tx_bps}"
+            );
+        }
+    }
 
     #[test]
     fn parses_sha256_pin_variants() {

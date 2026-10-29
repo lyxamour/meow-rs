@@ -394,7 +394,7 @@ async fn run(
                         auth_done = true;
                         if let Some(rate) = resp.brutal_rate(auth.tx_bps) {
                             // Only fails for a non-gcongestion sender, which
-                            // `build_quiche_config` sets whenever `up` is set.
+                            // `build_quiche_config` always sets.
                             match conn.set_brutal_bandwidth(rate) {
                                 Ok(()) => {
                                     st.pace = true;
