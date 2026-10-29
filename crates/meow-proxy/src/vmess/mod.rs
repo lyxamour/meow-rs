@@ -685,6 +685,86 @@ mod tests {
         }
     }
 
+    /// More than 65536 datagrams on one association: the u16 record counter
+    /// wraps in both directions, as it does in Xray / sing-box / mihomo, and
+    /// every datagram still arrives intact and in order.
+    #[tokio::test]
+    async fn native_udp_survives_record_counter_wrap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const N: u32 = 65_536 + 64;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adapter = test_adapter(
+            listener.local_addr().unwrap().port(),
+            Security::Aes128Gcm,
+            true,
+        );
+        let cmd_key = adapter.cmd_key;
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 42];
+            sock.read_exact(&mut prefix).await.unwrap();
+            let frame_len = header::tests::request_header_frame_len(&cmd_key, &prefix).unwrap();
+            let mut frame = prefix.to_vec();
+            frame.resize(frame_len, 0);
+            sock.read_exact(&mut frame[42..]).await.unwrap();
+            let pt = header::tests::server_open_request_header(&cmd_key, &frame).unwrap();
+            let req_iv: [u8; 16] = pt[1..17].try_into().unwrap();
+            let req_key: [u8; 16] = pt[17..33].try_into().unwrap();
+            sock.write_all(&header::tests::seal_response_header(
+                &req_key, &req_iv, pt[33],
+            ))
+            .await
+            .unwrap();
+            let mut cipher =
+                body::BodyCipher::server_mirror(Security::Aes128Gcm, &req_key, &req_iv);
+            let mut out = Vec::new();
+            for i in 0..N {
+                let rec = cipher
+                    .read_record(&mut sock)
+                    .await
+                    .unwrap()
+                    .expect("record");
+                assert_eq!(rec, i.to_be_bytes(), "upload record {i}");
+                cipher
+                    .write_record(&mut out, &(!i).to_be_bytes())
+                    .await
+                    .unwrap();
+            }
+            sock.write_all(&out).await.unwrap();
+            let _ = sock.read(&mut [0u8; 1]).await;
+        });
+
+        let metadata = Metadata {
+            network: meow_common::Network::Udp,
+            dst_ip: Some("1.2.3.4".parse().unwrap()),
+            dst_port: 53,
+            ..Default::default()
+        };
+        let conn = adapter.dial_udp(&metadata).await.expect("dial_udp");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let peer: std::net::SocketAddr = "1.2.3.4:53".parse().unwrap();
+        for i in 0..N {
+            tokio::time::timeout_at(deadline, conn.write_packet(&i.to_be_bytes(), &peer))
+                .await
+                .expect("write timed out")
+                .unwrap_or_else(|e| panic!("write {i}: {e}"));
+        }
+        let mut buf = [0u8; 16];
+        for i in 0..N {
+            let (n, _) = tokio::time::timeout_at(deadline, conn.read_packet(&mut buf))
+                .await
+                .expect("read timed out")
+                .unwrap_or_else(|e| panic!("read {i}: {e}"));
+            assert_eq!(&buf[..n], (!i).to_be_bytes(), "download record {i}");
+        }
+        drop(conn);
+        tokio::time::timeout_at(deadline, server)
+            .await
+            .expect("server timed out")
+            .expect("server task panicked");
+    }
+
     /// A UDP-capable mux session advertises UDP even with `udp` unset;
     /// `only-tcp` mux declines unless native UDP (`udp: true`) covers it.
     #[cfg(feature = "mux")]
