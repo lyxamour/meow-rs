@@ -82,6 +82,7 @@ impl ConnHandle {
 const CMD_CHANNEL_CAP: usize = 256;
 const STREAM_READ_CHANNEL_CAP: usize = 16;
 const UDP_SESSION_QUEUE: usize = 64;
+const RECV_BURST: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Id 0 is the HTTP/3 auth request; proxy bidi streams start at 4, step 4.
 const FIRST_PROXY_STREAM_ID: u64 = 4;
@@ -289,11 +290,14 @@ async fn run(
             r = st.socket.recv_from(&mut recv_buf) => {
                 match r {
                     Ok((n, from)) => {
-                        if let Some(mut dgram) = deobfs(&st, &recv_buf[..n]) {
-                            let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
-                            let info = quiche::RecvInfo { from, to: st.local };
-                            if let Err(e) = conn.recv(&mut dgram, info) {
-                                tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+                        recv_one(&st, &mut conn, &recv_buf[..n], from);
+                        // quiche ACKs on the next send(), so feed it every packet already
+                        // queued before pumping; otherwise each data packet costs one
+                        // ACK-only sendto.
+                        for _ in 1..RECV_BURST {
+                            match st.socket.try_recv_from(&mut recv_buf) {
+                                Ok((n, from)) => recv_one(&st, &mut conn, &recv_buf[..n], from),
+                                Err(_) => break,
                             }
                         }
                     }
@@ -703,6 +707,17 @@ fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
             }
         }
         let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+    }
+}
+
+/// Deobfuscate one datagram and feed it to quiche.
+fn recv_one(st: &State, conn: &mut quiche::Connection, raw: &[u8], from: std::net::SocketAddr) {
+    if let Some(mut dgram) = deobfs(st, raw) {
+        let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
+        let info = quiche::RecvInfo { from, to: st.local };
+        if let Err(e) = conn.recv(&mut dgram, info) {
+            tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+        }
     }
 }
 

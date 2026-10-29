@@ -1,6 +1,7 @@
 //! Portable QUIC peer for lifecycle, flow-control and TCP response regressions.
 use super::*;
 use crate::hysteria2::ReconnectableClient;
+use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 
@@ -26,6 +27,10 @@ struct Peer {
     read_payload: Arc<AtomicBool>,
     stop_writes: Arc<AtomicBool>,
     auth_seen: mpsc::UnboundedReceiver<SocketAddr>,
+    /// Datagrams the peer received that are too small to carry payload (ACK-only).
+    small_rx: Arc<AtomicUsize>,
+    /// Datagrams the peer sent that are big enough to carry payload.
+    big_tx: Arc<AtomicUsize>,
     task: DriverTask,
 }
 
@@ -98,6 +103,9 @@ fn peer_on(
     let stop_writes = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::clone(&stop_writes);
     let (auth_tx, auth_seen) = mpsc::unbounded_channel();
+    let small_rx = Arc::new(AtomicUsize::new(0));
+    let big_tx = Arc::new(AtomicUsize::new(0));
+    let (small_rx_task, big_tx_task) = (Arc::clone(&small_rx), Arc::clone(&big_tx));
     let task = DriverTask(tokio::spawn(async move {
         let mut incoming = vec![0; 65535];
         let (n, remote) = socket.recv_from(&mut incoming).await.unwrap();
@@ -241,6 +249,9 @@ fn peer_on(
                 }
             }
             while let Ok((n, info)) = conn.send(&mut out) {
+                if n > 1000 {
+                    big_tx_task.fetch_add(1, Ordering::Relaxed);
+                }
                 socket.send_to(&out[..n], info.to).await.unwrap();
             }
             if conn.is_closed() {
@@ -249,6 +260,9 @@ fn peer_on(
             tokio::select! {
                 packet = socket.recv_from(&mut incoming) => {
                     let (n, from) = packet.unwrap();
+                    if n < 100 {
+                        small_rx_task.fetch_add(1, Ordering::Relaxed);
+                    }
                     let _ = conn.recv(&mut incoming[..n], quiche::RecvInfo { from, to: local });
                 }
                 _ = sleep_opt(conn.timeout()) => conn.on_timeout(),
@@ -261,6 +275,8 @@ fn peer_on(
         read_payload,
         stop_writes,
         auth_seen,
+        small_rx,
+        big_tx,
         task,
     }
 }
@@ -551,4 +567,41 @@ async fn reset_releases_the_cached_connection_and_reconnects() {
         .unwrap()
         .expect("the post-reset dial authenticated on a new connection");
     assert!(client.reset(), "the reconnected connection was cached");
+}
+
+/// quiche ACKs on the next `send()` after any ACK-eliciting packet, so a driver
+/// that pumps after every datagram answers each data packet with its own
+/// ACK-only packet (one `sendto` each). Packets already queued on the socket must
+/// be fed to quiche before the driver sends.
+#[tokio::test]
+async fn acks_are_sent_once_per_burst_of_queued_packets() {
+    let peer = peer(true, Some(0), 16).await;
+    let client = peer.client(false);
+    let stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let size = 4 * 1024 * 1024;
+    let writing = tokio::spawn(async move {
+        writer.write_all(&vec![0x5a; size]).await.unwrap();
+        writer.shutdown().await.unwrap();
+    });
+    let mut echoed = Vec::new();
+    timeout(Duration::from_secs(15), reader.read_to_end(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    writing.await.unwrap();
+    assert_eq!(echoed.len(), size);
+    let (small, big) = (
+        peer.small_rx.load(Ordering::Relaxed),
+        peer.big_tx.load(Ordering::Relaxed),
+    );
+    eprintln!("ACK_RATIO small_rx={small} big_tx={big}");
+    assert!(big > 1000, "peer sent only {big} payload packets");
+    assert!(
+        small * 2 < big,
+        "{small} ACK-only packets for {big} payload packets"
+    );
 }
