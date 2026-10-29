@@ -91,6 +91,7 @@ impl Hy2Options {
             auth: self.password,
             insecure: self.skip_cert_verify,
             rx_bps: self.down_bps,
+            tx_bps: self.up_bps,
             obfs_password,
             hop_ports: self.ports.unwrap_or_default(),
             hop_interval_min_secs: hop_interval.min_secs,

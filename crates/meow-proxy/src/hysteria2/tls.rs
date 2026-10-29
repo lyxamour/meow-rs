@@ -58,6 +58,12 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     // UDP relay rides QUIC datagrams.
     quic.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
 
+    // Brutal replaces BBR after authentication (`Connection::set_brutal_bandwidth`),
+    // which needs the gcongestion sender. Without `up` keep quiche's default.
+    if config.tx_bps != 0 {
+        quic.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
+    }
+
     Ok(quic)
 }
 

@@ -14,6 +14,34 @@ const AUTH_STREAM: u64 = 0;
 // Client-initiated unidirectional control stream: type 0, SETTINGS (4), length 0.
 const SETTINGS: &[u8] = &[0, 4, 0];
 
+/// The server's `Hysteria-CC-RX`: its receive limit for our upload.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CcRx {
+    /// Bytes per second; 0 or absent means the server sets no limit.
+    Bytes(u64),
+    /// The server ignores client bandwidth and asks for bandwidth detection.
+    Auto,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthResponse {
+    pub(super) udp_enabled: bool,
+    pub(super) rx: CcRx,
+}
+
+impl AuthResponse {
+    /// Brutal target rate: apernet/hysteria core/client/client.go,
+    /// `actualTx = min(serverRx, clientTx)`, no Brutal for `auto` or `up: 0`.
+    pub(super) fn brutal_rate(&self, tx_bps: u64) -> Option<u64> {
+        match self.rx {
+            _ if tx_bps == 0 => None,
+            CcRx::Auto => None,
+            CcRx::Bytes(rx) if rx == 0 || rx > tx_bps => Some(tx_bps),
+            CcRx::Bytes(rx) => Some(rx),
+        }
+    }
+}
+
 pub(super) struct Auth {
     request: Vec<u8>,
     request_sent: usize,
@@ -49,7 +77,7 @@ impl Auth {
         })
     }
 
-    pub(super) fn poll(&mut self, conn: &mut quiche::Connection) -> Result<Option<bool>> {
+    pub(super) fn poll(&mut self, conn: &mut quiche::Connection) -> Result<Option<AuthResponse>> {
         if !send(conn, 2, SETTINGS, &mut self.settings_sent, false)?
             || !send(
                 conn,
@@ -97,10 +125,11 @@ fn send(
     Ok(*offset == bytes.len())
 }
 
-fn decode_response(bytes: &[u8]) -> Result<bool> {
+fn decode_response(bytes: &[u8]) -> Result<AuthResponse> {
     let mut pos = 0;
     let mut status_seen = false;
     let mut udp_enabled = false;
+    let mut rx = CcRx::Bytes(0);
     while pos < bytes.len() {
         let kind = proto::read_varint(bytes, &mut pos)?;
         let len = proto::read_varint(bytes, &mut pos)?;
@@ -130,6 +159,13 @@ fn decode_response(bytes: &[u8]) -> Result<bool> {
                         udp_enabled = value.eq_ignore_ascii_case("true")
                             || value == "1"
                             || value.eq_ignore_ascii_case("yes");
+                    } else if h.name() == b"hysteria-cc-rx" && !status_seen {
+                        let value = std::str::from_utf8(h.value()).unwrap_or("").trim();
+                        rx = if value.eq_ignore_ascii_case("auto") {
+                            CcRx::Auto
+                        } else {
+                            CcRx::Bytes(value.parse().unwrap_or(0))
+                        };
                     }
                 }
                 if !status_seen {
@@ -151,7 +187,7 @@ fn decode_response(bytes: &[u8]) -> Result<bool> {
             "missing authentication response headers".into(),
         ));
     }
-    Ok(udp_enabled)
+    Ok(AuthResponse { udp_enabled, rx })
 }
 
 #[cfg(test)]
@@ -159,16 +195,15 @@ mod tests {
     use super::*;
 
     fn response(status: &[u8], udp: &[u8]) -> Vec<u8> {
+        response_with(&[
+            Header::new(b":status", status),
+            Header::new(b"hysteria-udp", udp),
+        ])
+    }
+
+    fn response_with(headers: &[Header]) -> Vec<u8> {
         let mut encoded = [0; 1024];
-        let n = qpack::Encoder::new()
-            .encode(
-                &[
-                    Header::new(b":status", status),
-                    Header::new(b"hysteria-udp", udp),
-                ],
-                &mut encoded,
-            )
-            .unwrap();
+        let n = qpack::Encoder::new().encode(headers, &mut encoded).unwrap();
         let mut frame = vec![1];
         proto::put_varint(n as u64, &mut frame).unwrap();
         frame.extend_from_slice(&encoded[..n]);
@@ -177,8 +212,16 @@ mod tests {
 
     #[test]
     fn validates_auth_status_and_udp_header() {
-        assert!(decode_response(&response(b"233", b"TRUE")).unwrap());
-        assert!(!decode_response(&response(b"233", b"false")).unwrap());
+        assert!(
+            decode_response(&response(b"233", b"TRUE"))
+                .unwrap()
+                .udp_enabled
+        );
+        assert!(
+            !decode_response(&response(b"233", b"false"))
+                .unwrap()
+                .udp_enabled
+        );
         assert!(decode_response(&response(b"403", b"true")).is_err());
         assert!(decode_response(&[]).is_err());
     }
@@ -198,11 +241,51 @@ mod tests {
         let mut bytes = response(b"233", b"true");
         bytes.extend_from_slice(&[0, 3, b'a', b'b', b'c']);
         bytes.extend_from_slice(&[0x21, 0]); // Unknown, empty extension frame.
-        assert!(decode_response(&bytes).unwrap());
+        assert!(decode_response(&bytes).unwrap().udp_enabled);
         assert!(decode_response(&[0, 0]).is_err()); // DATA before HEADERS.
         assert!(decode_response(&[1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).is_err());
         bytes.extend_from_slice(&[4, 0]); // SETTINGS belongs on the control stream.
         assert!(decode_response(&bytes).is_err());
         assert!(decode_response(&[1, 2, 1, 0]).is_err()); // Dynamic QPACK reference.
+    }
+
+    fn rx_of(value: Option<&[u8]>) -> CcRx {
+        let mut h = vec![
+            Header::new(b":status", b"233"),
+            Header::new(b"hysteria-udp", b"true"),
+        ];
+        if let Some(v) = value {
+            h.push(Header::new(b"hysteria-cc-rx", v));
+        }
+        decode_response(&response_with(&h)).unwrap().rx
+    }
+
+    #[test]
+    fn parses_server_cc_rx() {
+        assert_eq!(rx_of(None), CcRx::Bytes(0));
+        assert_eq!(rx_of(Some(b"1250000")), CcRx::Bytes(1_250_000));
+        assert_eq!(rx_of(Some(b"Auto")), CcRx::Auto);
+        assert_eq!(rx_of(Some(b"junk")), CcRx::Bytes(0));
+    }
+
+    #[test]
+    fn brutal_rate_is_min_of_server_rx_and_up() {
+        let r = |rx, tx| {
+            AuthResponse {
+                udp_enabled: true,
+                rx,
+            }
+            .brutal_rate(tx)
+        };
+        // up = 0: never Brutal, whatever the server says.
+        assert_eq!(r(CcRx::Bytes(500), 0), None);
+        assert_eq!(r(CcRx::Bytes(0), 0), None);
+        // server unlimited: use up.
+        assert_eq!(r(CcRx::Bytes(0), 1000), Some(1000));
+        // server smaller / larger than up.
+        assert_eq!(r(CcRx::Bytes(400), 1000), Some(400));
+        assert_eq!(r(CcRx::Bytes(4000), 1000), Some(1000));
+        // server asks for bandwidth detection: BBR.
+        assert_eq!(r(CcRx::Auto, 1000), None);
     }
 }

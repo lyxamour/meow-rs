@@ -198,11 +198,28 @@ struct State {
     next_udp_session_id: u32,
     next_packet_id: u16,
     closed: Arc<AtomicBool>,
+    /// Honor quiche's pacing hint (`SendInfo::at`). Only once Brutal is active,
+    /// so connections without `up` send exactly as before.
+    pace: bool,
+    /// A packet quiche already produced that is not due yet.
+    held: Option<Held>,
+}
+
+/// Timer wakeups are ~1 ms coarse: sending each packet at its exact `at` would
+/// cap the rate near one packet per millisecond. Packets due within this slack
+/// go out together; `at` is absolute, so the average rate is kept.
+const PACING_SLACK: Duration = Duration::from_millis(1);
+
+struct Held {
+    payload: Vec<u8>,
+    dest: SocketAddr,
+    at: Instant,
 }
 
 struct AuthCtx {
     auth: String,
     rx_bps: u64,
+    tx_bps: u64,
 }
 
 /// Spawn a driver for a freshly created (pre-handshake) `quiche::Connection`.
@@ -240,12 +257,15 @@ pub(crate) async fn spawn(
         next_udp_session_id: 0,
         next_packet_id: 0,
         closed: Arc::clone(&closed),
+        pace: false,
+        held: None,
     };
 
     let (ready_tx, ready_rx) = oneshot::channel::<Result<bool>>();
     let auth = AuthCtx {
         auth: cfg.auth.clone(),
         rx_bps: cfg.rx_bps,
+        tx_bps: cfg.tx_bps,
     };
     let closed_task = Arc::clone(&closed);
     let task = DriverTask(tokio::spawn(async move {
@@ -300,6 +320,10 @@ async fn run(
         // Wake no later than the ACK-coalescing deadline, so a held ACK is
         // never dragged past it.
         let mut timeout = conn.timeout();
+        if let Some(held) = &st.held {
+            let left = held.at.saturating_duration_since(Instant::now());
+            timeout = Some(timeout.map_or(left, |t| t.min(left)));
+        }
         if let Some(since) = ack_since {
             let left = ACK_COALESCE_DELAY.saturating_sub(since.elapsed());
             timeout = Some(timeout.map_or(left, |t| t.min(left)));
@@ -358,10 +382,18 @@ async fn run(
         if !auth_done {
             if let Some(handshake) = handshake.as_mut() {
                 match handshake.poll(&mut conn) {
-                    Ok(Some(enabled)) => {
+                    Ok(Some(resp)) => {
                         auth_done = true;
+                        if let Some(rate) = resp.brutal_rate(auth.tx_bps) {
+                            // Only fails for a non-gcongestion sender, which
+                            // `build_quiche_config` sets whenever `up` is set.
+                            match conn.set_brutal_bandwidth(rate) {
+                                Ok(()) => st.pace = true,
+                                Err(e) => tracing::warn!("hysteria2 brutal not enabled: {e}"),
+                            }
+                        }
                         if let Some(tx) = ready_tx.take() {
-                            let _ = tx.send(Ok(enabled));
+                            let _ = tx.send(Ok(resp.udp_enabled));
                         }
                     }
                     Ok(None) => {}
@@ -776,6 +808,13 @@ async fn flush_send(
     out: &mut [u8],
 ) -> std::io::Result<()> {
     loop {
+        if let Some(held) = st.held.take() {
+            if held.at > Instant::now() + PACING_SLACK {
+                st.held = Some(held);
+                return Ok(());
+            }
+            st.socket.send_to(&held.payload, held.dest).await?;
+        }
         let (write, info) = match conn.send(out) {
             Ok(v) => v,
             Err(quiche::Error::Done) => return Ok(()),
@@ -796,6 +835,14 @@ async fn flush_send(
             queued = conn.dgram_send_queue_len(),
             "hysteria2 transmitting QUIC packet"
         );
+        if st.pace && info.at > Instant::now() + PACING_SLACK {
+            st.held = Some(Held {
+                payload,
+                dest,
+                at: info.at,
+            });
+            return Ok(());
+        }
         st.socket.send_to(&payload, dest).await?;
     }
 }

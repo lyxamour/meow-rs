@@ -46,11 +46,16 @@ struct Peer {
 
 impl Peer {
     fn client(&self, fast_open: bool) -> ReconnectableClient {
+        self.client_up(fast_open, 0)
+    }
+
+    fn client_up(&self, fast_open: bool, tx_bps: u64) -> ReconnectableClient {
         ReconnectableClient::new(Config {
             server_addr: self.addr.to_string(),
             server_name: "localhost".into(),
             insecure: true,
             fast_open,
+            tx_bps,
             ..Config::default()
         })
     }
@@ -717,4 +722,48 @@ async fn lone_packet_is_acked_within_the_coalescing_deadline() {
     let median = lags[lags.len() / 2];
     eprintln!("LONE_ACK_LAG_US {lags:?}");
     assert!(median < 12_000, "median ACK lag {median} us: {lags:?}");
+}
+
+/// Seconds to push and get echoed back `UPLOAD` bytes through a client with `up` = `tx_bps`.
+const UPLOAD: usize = 2 * 1024 * 1024;
+
+async fn echo_time(tx_bps: u64) -> Duration {
+    let peer = peer(true, Some(0), 16).await;
+    let client = peer.client_up(false, tx_bps);
+    let stream = timeout(TEST_TIMEOUT, client.tcp_connect(TARGET))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let started = Instant::now();
+    timeout(Duration::from_secs(20), async {
+        tokio::join!(
+            async {
+                writer.write_all(&vec![0x5a; UPLOAD]).await.unwrap();
+                writer.shutdown().await.unwrap();
+            },
+            async {
+                let mut echoed = Vec::new();
+                reader.read_to_end(&mut echoed).await.unwrap();
+                assert_eq!(echoed.len(), UPLOAD);
+            }
+        );
+    })
+    .await
+    .unwrap();
+    started.elapsed()
+}
+
+/// `up` engages Brutal: the upload is held to about that rate (loopback RTT is
+/// tiny, so cwnd binds before pacing does; pacing is checked in the netem run).
+/// Without `up` nothing changes and loopback is unthrottled.
+#[tokio::test]
+async fn up_paces_the_upload_and_zero_leaves_it_alone() {
+    let unpaced = echo_time(0).await;
+    // 2 MiB at 3 MB/s needs about 0.7 s, minus the initial burst.
+    let paced = echo_time(3_000_000).await;
+    eprintln!("BRUTAL_UPLOAD unpaced={unpaced:?} paced={paced:?}");
+    assert!(paced >= Duration::from_millis(500), "paced {paced:?}");
+    assert!(paced < Duration::from_secs(5), "paced {paced:?}");
+    assert!(unpaced * 3 < paced, "unpaced {unpaced:?} paced {paced:?}");
 }

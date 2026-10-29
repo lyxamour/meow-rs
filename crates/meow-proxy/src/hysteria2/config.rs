@@ -5,6 +5,8 @@ pub struct Config {
     pub auth: String,
     pub insecure: bool,
     pub rx_bps: u64,
+    /// Client upload rate (`up`), bytes per second. Non-zero enables Brutal.
+    pub tx_bps: u64,
     pub obfs_password: String,
     pub hop_ports: String,
     pub hop_interval_min_secs: u64,
