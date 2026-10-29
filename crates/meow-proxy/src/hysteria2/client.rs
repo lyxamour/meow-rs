@@ -207,6 +207,11 @@ async fn connect_addr(
     // into the device and loop (issue #695).
     let socket = meow_common::bind_udp(bind_addr).await.map_err(Error::Io)?;
     let local = socket.local_addr().map_err(Error::Io)?;
+    if driver::CAN_DONT_FRAGMENT {
+        if let Err(e) = driver::set_dont_fragment(&socket, server_addr.is_ipv6()) {
+            tracing::warn!("hysteria2 could not set don't-fragment: {e}");
+        }
+    }
 
     let mut config = super::tls::build_quiche_config(cfg)?;
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];

@@ -824,7 +824,7 @@ async fn flush_send(
                 st.held = Some(held);
                 return Ok(());
             }
-            st.socket.send_to(&held.payload, held.dest).await?;
+            send_dgram(&st.socket, &held.payload, held.dest).await?;
         }
         let (write, info) = match conn.send(out) {
             Ok(v) => v,
@@ -854,7 +854,122 @@ async fn flush_send(
             });
             return Ok(());
         }
-        st.socket.send_to(&payload, dest).await?;
+        send_dgram(&st.socket, &payload, dest).await?;
+    }
+}
+
+/// Largest UDP payload quiche is allowed to grow to once path MTU discovery
+/// succeeds (quic-go: `MaxPacketBufferSize`, 1452 = 1500 - IPv4 and UDP
+/// headers). The client sends 1200-byte packets until a probe is acked.
+pub(super) const MAX_UDP_PAYLOAD: usize = 1452;
+
+/// Platforms where [`set_dont_fragment`] works. Path MTU discovery is only
+/// enabled there: without the DF bit a probe larger than the path is
+/// fragmented and "succeeds", and the full-size packets that follow can be
+/// lost on paths that drop fragments.
+pub(super) const CAN_DONT_FRAGMENT: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+));
+
+/// Set the don't-fragment bit, so a PMTU probe that does not fit the path is
+/// refused (`EMSGSIZE`, see [`send_dgram`]) or dropped instead of fragmented.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn set_dont_fragment(socket: &UdpSocket, v6: bool) -> std::io::Result<()> {
+    let (level, name, value) = if v6 {
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_DO,
+        )
+    } else {
+        (
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_DO,
+        )
+    };
+    setsockopt_int(socket, level, name, value)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(super) fn set_dont_fragment(socket: &UdpSocket, v6: bool) -> std::io::Result<()> {
+    let (level, name) = if v6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_DONTFRAG)
+    };
+    setsockopt_int(socket, level, name, 1)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+pub(super) fn set_dont_fragment(_socket: &UdpSocket, _v6: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn setsockopt_int(
+    socket: &UdpSocket,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the fd is open for the lifetime of `socket`; `value` outlives the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            name,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `sendto`, except that a datagram the OS refuses as too big for the path
+/// (`EMSGSIZE`, only with DF set) is dropped: for a PMTU probe that is the
+/// "does not fit" answer, and quiche treats the packet as lost.
+async fn send_dgram(socket: &UdpSocket, payload: &[u8], dest: SocketAddr) -> std::io::Result<()> {
+    match socket.send_to(payload, dest).await {
+        Ok(_) => Ok(()),
+        Err(e) if is_msgsize(&e) => {
+            tracing::debug!(
+                bytes = payload.len(),
+                "hysteria2 datagram too big for the path, dropped"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn is_msgsize(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::EMSGSIZE)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
     }
 }
 

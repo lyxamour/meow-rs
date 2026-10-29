@@ -22,6 +22,72 @@ async fn raw_udp_round_trip_without_http3_datagrams() {
     }
 }
 
+/// The DF bit is what makes a too-big PMTU probe fail instead of being
+/// fragmented and "delivered". Read the option back from the socket.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+#[tokio::test]
+async fn dont_fragment_is_set_on_the_socket() {
+    use std::os::fd::AsRawFd;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let read = |socket: &UdpSocket| {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (level, name) = (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (level, name) = (libc::IPPROTO_IP, libc::IP_DONTFRAG);
+        let mut value: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        value
+    };
+    let before = read(&socket);
+    set_dont_fragment(&socket, false).unwrap();
+    let after = read(&socket);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    assert_eq!(
+        (before, after),
+        (libc::IP_PMTUDISC_WANT, libc::IP_PMTUDISC_DO)
+    );
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    assert_eq!((before, after), (0, 1));
+}
+
+/// An `EMSGSIZE` from the OS must not tear the connection down: for a PMTU
+/// probe it is the "does not fit" answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn too_big_datagram_is_dropped_not_fatal() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dest = sink.local_addr().unwrap();
+    let huge = vec![0u8; 70_000];
+    // Positive control: the OS refuses it, so the swallow below is exercised.
+    let raw = socket.send_to(&huge, dest).await.unwrap_err();
+    assert!(is_msgsize(&raw), "expected EMSGSIZE, got {raw}");
+    send_dgram(&socket, &huge, dest).await.unwrap();
+    // A normal datagram still goes out and arrives intact.
+    send_dgram(&socket, b"ok", dest).await.unwrap();
+    let mut buf = [0u8; 16];
+    let (n, _) = timeout(TEST_TIMEOUT, sink.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"ok");
+}
+
 struct Peer {
     addr: SocketAddr,
     read_payload: Arc<AtomicBool>,

@@ -55,6 +55,13 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     quic.set_initial_max_streams_uni(MAX_CONCURRENT_STREAMS);
     // hysteria2 disables the QUIC bit greasing.
     quic.grease(false);
+    // quic-go (sing-box, mihomo) probes up to 1452 bytes. The sender is bound
+    // by the per-packet sendto, so packet size is rate: 1200 -> 1452 bytes
+    // took a 128 MiB upload (20 ms netem) from ~400 to ~480 Mbit/s.
+    if super::driver::CAN_DONT_FRAGMENT {
+        quic.set_max_send_udp_payload_size(super::driver::MAX_UDP_PAYLOAD);
+        quic.discover_pmtu(true);
+    }
     // UDP relay rides QUIC datagrams.
     quic.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
 
@@ -66,6 +73,10 @@ pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     // mihomo's BBR do not. Netem 5% random loss + 20 ms, 128 MiB upload:
     // default 12-18 Mbit/s, 0.3 -> 177-251, 0.6 -> 295-398, sing-box ~450.
     quic.set_bbr_loss_threshold(0.6);
+    // Its lower bounds (`bandwidth_lo`, `inflight_lo`) shrink on any loss in a
+    // round, which random loss turns into a collapsing window (cwnd 100 KB,
+    // 4 MB/s stalls at 5% loss + 20 ms); sing-quic's BBR never reacts to loss.
+    quic.set_bbr_lower_bounds_loss_threshold(0.6);
 
     Ok(quic)
 }
@@ -171,6 +182,8 @@ mod tests {
     use super::*;
     use boring::pkey::{PKey, Private};
     use boring::x509::X509;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
 
     /// quiche exposes no getter for the algorithm; `set_brutal_bandwidth` only
@@ -200,6 +213,205 @@ mod tests {
                 "tx_bps={tx_bps}"
             );
         }
+    }
+
+    /// The link between the in-memory client and server.
+    #[derive(Clone, Copy)]
+    struct Link {
+        /// Every n-th client packet is lost.
+        drop_every: Option<usize>,
+        /// One-way delay.
+        delay: Duration,
+        /// Replaces the BBR lower-bound loss threshold of the tuned config.
+        lower_bounds: Option<f32>,
+        /// Client packets longer than this are dropped, as DF does.
+        path_mtu: usize,
+    }
+
+    const CLEAN_LINK: Link = Link {
+        drop_every: None,
+        delay: Duration::ZERO,
+        lower_bounds: None,
+        path_mtu: usize::MAX,
+    };
+
+    /// Client built by [`build_quiche_config`] (BBR lower-bound threshold
+    /// overridden by `lower_bounds`) uploading `total` bytes to an in-memory
+    /// quiche server through a `delay` one-way link. Every `drop_every`-th
+    /// client packet is lost.
+    /// Returns the client's path stats and the bytes the server read.
+    fn upload(total: usize, link: Link) -> (quiche::PathStats, usize) {
+        let Link {
+            drop_every,
+            delay,
+            lower_bounds,
+            path_mtu,
+        } = link;
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut ssl = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        ssl.set_certificate(&X509::from_der(key.cert.der()).unwrap())
+            .unwrap();
+        ssl.set_private_key(&PKey::private_key_from_der(&key.key_pair.serialize_der()).unwrap())
+            .unwrap();
+        let mut server_cfg =
+            quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl).unwrap();
+        server_cfg.set_application_protos(&[b"h3"]).unwrap();
+        server_cfg.set_initial_max_data(1 << 28);
+        server_cfg.set_initial_max_streams_bidi(8);
+        server_cfg.set_initial_max_stream_data_bidi_remote(1 << 28);
+
+        let mut client_cfg = build_quiche_config(&Config {
+            insecure: true,
+            ..Config::default()
+        })
+        .unwrap();
+        if let Some(threshold) = lower_bounds {
+            client_cfg.set_bbr_lower_bounds_loss_threshold(threshold);
+        }
+        let (c_addr, s_addr): (std::net::SocketAddr, std::net::SocketAddr) = (
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        );
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &quiche::ConnectionId::from_ref(&[7; 16]),
+            c_addr,
+            s_addr,
+            &mut client_cfg,
+        )
+        .unwrap();
+        let mut server: Option<quiche::Connection> = None;
+
+        let mut buf = vec![0u8; 65535];
+        let mut sink = vec![0u8; 65535];
+        let payload = vec![0u8; 64 * 1024];
+        let (mut sent, mut received, mut packets) = (0usize, 0usize, 0usize);
+        // One-way delay line per direction: (due time, datagram).
+        let mut to_server: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+        let mut to_client: VecDeque<(Instant, Vec<u8>)> = VecDeque::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while received < total {
+            assert!(
+                Instant::now() < deadline,
+                "upload stalled at {received}/{total}"
+            );
+            std::thread::sleep(Duration::from_micros(200));
+            if client.is_established() && sent < total {
+                if let Ok(n) = client.stream_send(0, &payload, false) {
+                    sent += n;
+                }
+            }
+            while let Ok((n, _)) = client.send(&mut buf) {
+                packets += 1;
+                if n > path_mtu || drop_every.is_some_and(|k| packets % k == 0) {
+                    continue;
+                }
+                to_server.push_back((Instant::now() + delay, buf[..n].to_vec()));
+            }
+            while to_server
+                .front()
+                .is_some_and(|(due, _)| *due <= Instant::now())
+            {
+                let (_, mut pkt) = to_server.pop_front().unwrap();
+                let srv = server.get_or_insert_with(|| {
+                    let hdr =
+                        quiche::Header::from_slice(&mut pkt, quiche::MAX_CONN_ID_LEN).unwrap();
+                    quiche::accept(&hdr.dcid, None, s_addr, c_addr, &mut server_cfg).unwrap()
+                });
+                let info = quiche::RecvInfo {
+                    from: c_addr,
+                    to: s_addr,
+                };
+                srv.recv(&mut pkt, info).unwrap();
+            }
+            if let Some(srv) = server.as_mut() {
+                while let Ok((n, _)) = srv.stream_recv(0, &mut sink) {
+                    received += n;
+                }
+                while let Ok((n, _)) = srv.send(&mut buf) {
+                    to_client.push_back((Instant::now() + delay, buf[..n].to_vec()));
+                }
+                srv.on_timeout();
+            }
+            while to_client
+                .front()
+                .is_some_and(|(due, _)| *due <= Instant::now())
+            {
+                let (_, mut pkt) = to_client.pop_front().unwrap();
+                let info = quiche::RecvInfo {
+                    from: s_addr,
+                    to: c_addr,
+                };
+                client.recv(&mut pkt, info).unwrap();
+            }
+            client.on_timeout();
+        }
+        let stats = client.path_stats().next().unwrap();
+        (stats, received)
+    }
+
+    /// On a clean link the client's packets grow to quic-go's 1452 bytes.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn pmtu_discovery_reaches_the_quic_go_packet_size() {
+        let (stats, received) = upload(8 << 20, CLEAN_LINK);
+        assert!(received >= 8 << 20);
+        assert_eq!(stats.pmtu, 1452);
+    }
+
+    /// A path that drops anything above 1400 bytes (what DF does): the upload
+    /// completes only because probing settles below the limit. Sending 1452
+    /// from the start, without probing, stalls.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn pmtu_discovery_settles_below_a_small_path_mtu() {
+        let link = Link {
+            path_mtu: 1400,
+            ..CLEAN_LINK
+        };
+        let (stats, received) = upload(8 << 20, link);
+        assert!(received >= 8 << 20);
+        assert!((1201..=1400).contains(&stats.pmtu), "pmtu {}", stats.pmtu);
+    }
+
+    /// Under random loss (10%, 10 ms RTT) BBRv2 with its lower bounds
+    /// shrinking on any loss needs ~40% longer than with the threshold
+    /// `build_quiche_config` sets. Alternate the two so load hits both.
+    #[test]
+    fn random_loss_does_not_ratchet_the_window_down() {
+        let timed = |lower_bounds: Option<f32>| {
+            let t0 = Instant::now();
+            let link = Link {
+                drop_every: Some(10),
+                delay: Duration::from_millis(5),
+                lower_bounds,
+                ..CLEAN_LINK
+            };
+            let (_, received) = upload(64 << 20, link);
+            assert!(received >= 64 << 20);
+            t0.elapsed()
+        };
+        let (mut tuned, mut spec) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            tuned.push(timed(None));
+            spec.push(timed(Some(0.0)));
+        }
+        tuned.sort();
+        spec.sort();
+        assert!(
+            tuned[1].as_secs_f64() < spec[1].as_secs_f64() * 0.9,
+            "tuned {tuned:?} vs spec {spec:?}"
+        );
     }
 
     #[test]
