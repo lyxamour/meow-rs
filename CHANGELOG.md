@@ -27,6 +27,12 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **VMess no longer drops a connection after 65536 body records per
+  direction**: the AEAD record counter is a u16 on the wire, and Xray,
+  sing-vmess and mihomo all let it wrap. meow-rs errored instead, which cut
+  off any TCP transfer past about 1 GiB and would end a busy UDP
+  association after 65536 datagrams. The counter now wraps like the peers.
+
 - **The built-in `v2ray-plugin` client works with servers on default
   options**: an official v2ray-plugin server multiplexes with Mux.Cool
   unless it runs with `mux=0`, but meow parsed `mux` and then sent the
