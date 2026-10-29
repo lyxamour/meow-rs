@@ -276,6 +276,11 @@ async fn run(
         KEEP_ALIVE_INTERVAL,
     );
     keep_alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // quiche's timer, re-armed only when its deadline moves rather than
+    // rebuilt on every wakeup.
+    let timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(timer);
+    let mut armed = None;
 
     if let Err(e) = flush_send(&mut st, &mut conn, &mut send_buf).await {
         // `Io` carries the socket errno through `hy2_error` →
@@ -288,7 +293,13 @@ async fn run(
 
     let mut exit = Error::Closed;
     loop {
-        let timeout = conn.timeout();
+        let deadline = conn.timeout_instant();
+        if deadline != armed {
+            if let Some(after) = conn.timeout() {
+                timer.as_mut().reset(tokio::time::Instant::now() + after);
+            }
+            armed = deadline;
+        }
         tokio::select! {
             r = st.socket.readable() => {
                 if let Err(e) = r.and_then(|()| recv_batch(&mut st, &mut conn, &mut recv_buf)) {
@@ -302,7 +313,10 @@ async fn run(
                     None => { let _ = conn.close(true, 0x0, b"done"); }
                 }
             }
-            _ = sleep_opt(timeout) => { conn.on_timeout(); }
+            () = &mut timer, if armed.is_some() => {
+                armed = None;
+                conn.on_timeout();
+            }
             _ = st.read_notify.notified() => {}
             _ = keep_alive.tick(), if auth_done => {
                 let _ = conn.send_ack_eliciting();
@@ -760,13 +774,6 @@ async fn flush_send(
             "hysteria2 transmitting QUIC packet"
         );
         st.socket.send_to(&payload, dest).await?;
-    }
-}
-
-async fn sleep_opt(timeout: Option<Duration>) {
-    match timeout {
-        Some(d) => tokio::time::sleep(d).await,
-        None => std::future::pending::<()>().await,
     }
 }
 

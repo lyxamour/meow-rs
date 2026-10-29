@@ -22,6 +22,56 @@ async fn raw_udp_round_trip_without_http3_datagrams() {
     }
 }
 
+/// quiche's loss-recovery timer is the only thing that resends a lost
+/// handshake packet: the driver must wake for it with no socket or command
+/// activity. A relay in front of the peer drops everything the client sends in
+/// its first 300 ms; no ACK ever comes back to trigger a fast retransmit, so
+/// the connection only comes up if the timer fires.
+#[tokio::test]
+async fn timer_retransmits_a_lost_handshake() {
+    let peer = peer(true, Some(0), 16).await;
+    let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front.local_addr().unwrap();
+    let back = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    back.connect(peer.addr).await.unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let dropped_relay = Arc::clone(&dropped);
+    let started = tokio::time::Instant::now();
+    let relay = tokio::spawn(async move {
+        let mut up = vec![0; 65535];
+        let mut down = vec![0; 65535];
+        let mut client = None;
+        loop {
+            tokio::select! {
+                r = front.recv_from(&mut up) => {
+                    let (n, from) = r.unwrap();
+                    client = Some(from);
+                    if started.elapsed() < Duration::from_millis(300) {
+                        dropped_relay.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        back.send(&up[..n]).await.unwrap();
+                    }
+                }
+                r = back.recv(&mut down) => {
+                    let n = r.unwrap();
+                    front.send_to(&down[..n], client.unwrap()).await.unwrap();
+                }
+            }
+        }
+    });
+    let client = ReconnectableClient::new(Config {
+        server_addr: front_addr.to_string(),
+        server_name: "localhost".into(),
+        insecure: true,
+        fast_open: true,
+        ..Config::default()
+    });
+    let udp = timeout(TEST_TIMEOUT, client.udp()).await;
+    relay.abort();
+    assert!(udp.unwrap().is_ok());
+    assert!(dropped.load(Ordering::Relaxed) > 0, "nothing was dropped");
+}
+
 struct Peer {
     addr: SocketAddr,
     read_payload: Arc<AtomicBool>,
@@ -278,6 +328,13 @@ fn peer_on(
         small_rx,
         big_tx,
         task,
+    }
+}
+
+async fn sleep_opt(timeout: Option<Duration>) {
+    match timeout {
+        Some(d) => sleep(d).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
