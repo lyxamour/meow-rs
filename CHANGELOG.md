@@ -8,6 +8,14 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- **VMess relays UDP natively when `mux` is off**: `udp: true` on a VMess
+  node used to fail every UDP dial unless a UDP-capable mux was enabled.
+  meow now sends the request with `CommandUDP` and carries one datagram
+  per body record, as sing-vmess and mihomo do. A UDP-capable mux is still
+  preferred when configured.
+
 ### Changed
 
 - **`v2ray-plugin`'s `mux` now defaults to on**, as in the upstream
