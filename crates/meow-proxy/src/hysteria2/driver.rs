@@ -82,7 +82,10 @@ impl ConnHandle {
 const CMD_CHANNEL_CAP: usize = 256;
 const STREAM_READ_CHANNEL_CAP: usize = 16;
 const UDP_SESSION_QUEUE: usize = 64;
-const RECV_BURST: usize = 64;
+/// Datagrams fed to quiche per socket wakeup before the driver flushes. One
+/// flush then acknowledges the whole batch, where a flush per datagram sent
+/// an ACK (and a syscall) for every packet of a download.
+const RECV_BATCH: usize = 32;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Id 0 is the HTTP/3 auth request; proxy bidi streams start at 4, step 4.
 const FIRST_PROXY_STREAM_ID: u64 = 4;
@@ -287,21 +290,10 @@ async fn run(
     loop {
         let timeout = conn.timeout();
         tokio::select! {
-            r = st.socket.recv_from(&mut recv_buf) => {
-                match r {
-                    Ok((n, from)) => {
-                        recv_one(&st, &mut conn, &recv_buf[..n], from);
-                        // quiche ACKs on the next send(), so feed it every packet already
-                        // queued before pumping; otherwise each data packet costs one
-                        // ACK-only sendto.
-                        for _ in 1..RECV_BURST {
-                            match st.socket.try_recv_from(&mut recv_buf) {
-                                Ok((n, from)) => recv_one(&st, &mut conn, &recv_buf[..n], from),
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    Err(e) => { fail(&mut ready_tx, &mut st, Error::Io(e)); break; }
+            r = st.socket.readable() => {
+                if let Err(e) = r.and_then(|()| recv_batch(&mut st, &mut conn, &mut recv_buf)) {
+                    fail(&mut ready_tx, &mut st, Error::Io(e));
+                    break;
                 }
             }
             maybe = st.cmd_rx.recv() => {
@@ -710,15 +702,34 @@ fn cleanup_streams(st: &mut State, conn: &mut quiche::Connection) {
     }
 }
 
-/// Deobfuscate one datagram and feed it to quiche.
-fn recv_one(st: &State, conn: &mut quiche::Connection, raw: &[u8], from: std::net::SocketAddr) {
-    if let Some(mut dgram) = deobfs(st, raw) {
+/// Feed the datagrams queued on the socket to quiche, at most
+/// [`RECV_BATCH`] of them, undoing obfs and port-hopping. quiche ACKs on the
+/// next send(), so batching them is what saves an ACK-only sendto per packet.
+fn recv_batch(
+    st: &mut State,
+    conn: &mut quiche::Connection,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    for _ in 0..RECV_BATCH {
+        let (n, from) = match st.socket.try_recv_from(buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => return Err(e),
+        };
         let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
         let info = quiche::RecvInfo { from, to: st.local };
-        if let Err(e) = conn.recv(&mut dgram, info) {
+        let received = match st.obfs.as_ref() {
+            Some(obfs) => match obfs.decode(&buf[..n]) {
+                Some(mut dgram) => conn.recv(&mut dgram, info),
+                None => continue,
+            },
+            None => conn.recv(&mut buf[..n], info),
+        };
+        if let Err(e) = received {
             tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
         }
     }
+    Ok(())
 }
 
 /// Drain quiche's send queue to the socket, applying obfs and port-hopping.
@@ -749,13 +760,6 @@ async fn flush_send(
             "hysteria2 transmitting QUIC packet"
         );
         st.socket.send_to(&payload, dest).await?;
-    }
-}
-
-fn deobfs(st: &State, raw: &[u8]) -> Option<Vec<u8>> {
-    match st.obfs.as_ref() {
-        Some(obfs) => obfs.decode(raw),
-        None => Some(raw.to_vec()),
     }
 }
 
