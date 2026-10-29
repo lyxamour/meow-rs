@@ -207,10 +207,12 @@ struct State {
     held: Option<Held>,
 }
 
-/// Timer wakeups are ~1 ms coarse: sending each packet at its exact `at` would
-/// cap the rate near one packet per millisecond. Packets due within this slack
-/// go out together; `at` is absolute, so the average rate is kept.
-const PACING_SLACK: Duration = Duration::from_millis(1);
+/// Timer wakeups are ~1 ms coarse, and every wakeup costs a loop iteration:
+/// sending each packet at its exact `at` caps the rate well below the target.
+/// Packets due within this slack go out together; `at` is absolute, so the
+/// average rate is kept. Measured at a 100 Mbit/s target, docker loopback-like
+/// RTT (netem 0% and 5% loss): 1 ms -> 72 Mbit/s, 3 ms -> 99, 8 ms -> 108.
+const PACING_SLACK: Duration = Duration::from_millis(3);
 
 struct Held {
     payload: Vec<u8>,
